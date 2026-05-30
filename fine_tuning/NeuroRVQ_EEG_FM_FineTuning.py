@@ -1,11 +1,11 @@
 import numpy as np
 import torch
+from lightning.pytorch import LightningModule, Trainer
 from inference.modules.NeuroRVQ_EEG_tokenizer_inference_modules import ch_names_global, create_embedding_ix, check_model_eval_mode
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from torch.utils.data import DataLoader
 import warnings
-from tqdm import tqdm
 
 def get_class_weights(y, n_cls):
     y = torch.Tensor(y)
@@ -20,11 +20,13 @@ def get_class_weights(y, n_cls):
     class_weights = class_weights.cuda()
     return class_weights
 
-class NeuroRVQModule():
+class NeuroRVQModule(LightningModule):
     '''
     Module that performs fine-tuning of NeuroRVQ
     '''
     def __init__(self, sample_length, chnames, n_out, train_head_only, args, foundation_model):
+        super().__init__()
+        self.save_hyperparameters(ignore=['foundation_model'])
         self.n_time = sample_length // args['patch_size']
         chnames = np.array([c.lower().encode() for c in chnames])
         self.chmask = np.isin(chnames, ch_names_global)
@@ -32,6 +34,8 @@ class NeuroRVQModule():
         self.n_out = n_out
         self.model = foundation_model
         self.train_head_only = train_head_only
+        self.d_out = self.n_out if self.n_out > 2 else 1
+        self.model.reset_classifier(self.d_out)
         self.criterion = F.cross_entropy if self.n_out > 2 else F.binary_cross_entropy_with_logits
         self.results = {'train_accuracy': [], 'val_accuracy': [], 'train_bacc': [], 'val_bacc': []}
         self.weight_decay = args['weight_decay_finetuning']
@@ -41,23 +45,41 @@ class NeuroRVQModule():
         self.layer_decay = float(args['layer_decay_finetuning'])
         self.n_patches = args['n_patches']
         self.patch_size = args['patch_size']
+        self.temp_embed_ix = None
+        self.spat_embed_ix = None
+        self.class_weights = None
+        self.train_preds = []
+        self.train_targets = []
+        self.val_preds = []
+        self.val_targets = []
+
+        if self.train_head_only:
+            for name, param in self.model.named_parameters():
+                if 'head.' in name or 'fc_norm.' in name:
+                    continue
+                param.requires_grad = False
+
+    def setup(self, stage=None):
+        if self.temp_embed_ix is None or self.spat_embed_ix is None:
+            temp_embed_ix, spat_embed_ix = create_embedding_ix(
+                self.n_time,
+                self.n_patches,
+                self.chnames,
+                ch_names_global,
+            )
+            self.temp_embed_ix = temp_embed_ix
+            self.spat_embed_ix = spat_embed_ix
 
     def size(self):
         """ Returns number of trainable parameters in model """
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
-    def fit(self, train_dataset, validation_dataset, batch_size, epochs):
-        d_out = self.n_out if self.n_out > 2 else 1
-        self.model.reset_classifier(d_out)
-        self.model.cuda()
-        # Set model parameter groups with layer_decay on the learning rate
-        if self.train_head_only:
-            for name, param in self.model.named_parameters():
-                if 'head.' in name or 'fc_norm.' in name:
-                    continue
-                else:
-                    param.requires_grad = False
+    def forward(self, x):
+        temp_embed_ix = self.temp_embed_ix.to(self.device)
+        spat_embed_ix = self.spat_embed_ix.to(self.device)
+        return self.model(x, temp_embed_ix, spat_embed_ix)
 
+    def _build_param_groups(self):
         param_groups = {}
         for i_m, (p_name, param) in enumerate(self.model.named_parameters()):  # model layers
             if not param.requires_grad:
@@ -71,93 +93,130 @@ class NeuroRVQModule():
                                         'weight_decay': self.weight_decay,
                                         'lr': self.lr * self.layer_decay ** (
                                                 len(list(self.model.named_parameters())) - i_m)}
+        return list(param_groups.values())
 
-        # Optimizer and lr_scheduler
-        optimizer = torch.optim.AdamW(list(param_groups.values()))
-        n_batches_train = int(np.ceil(len(train_dataset) / batch_size))
-        if epochs < self.warmup_epochs + 1:
-            lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-1, end_factor=1,
-                                                             total_iters=epochs * n_batches_train)
+    def _shared_step(self, batch, stage):
+        x_b, y_b = batch
+        x_b = x_b[:, self.chmask, :]
+        n, c, t = x_b.shape
+        x_b = x_b.reshape(n, c, self.n_time, self.patch_size)
+        y_b = y_b.long() if self.n_out > 2 else y_b.float()
+
+        with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.device.type == 'cuda'):
+            p, _ = self(x_b)
+            p = p.squeeze(-1)
+            loss_weight = self.class_weights.to(self.device) if p.ndim == 2 else self.class_weights.to(self.device)[y_b.long()]
+            loss = self.criterion(p, y_b.to(self.device), weight=loss_weight)
+
+        pred = p.detach().cpu().float()
+        pred = pred.argmax(dim=-1) if pred.ndim == 2 else torch.round(torch.sigmoid(pred))
+        target = y_b.detach().cpu()
+
+        if stage == 'train':
+            self.train_preds.append(pred.numpy())
+            self.train_targets.append(target.numpy())
         else:
-            scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-1, end_factor=1,
-                                                           total_iters=self.warmup_epochs * n_batches_train)
-            scheduler2 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1, end_factor=1e-1,
-                                                           total_iters=(epochs - self.warmup_epochs) * n_batches_train)
-            lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [scheduler1, scheduler2],
-                                                                 milestones=[self.warmup_epochs * n_batches_train])
+            self.val_preds.append(pred.numpy())
+            self.val_targets.append(target.numpy())
+
+        self.log(f'{stage}_loss', loss, prog_bar=(stage == 'val'), on_step=False, on_epoch=True)
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, 'train')
+
+    def validation_step(self, batch, batch_idx):
+        self._shared_step(batch, 'val')
+
+    def on_train_epoch_start(self):
+        self.train_preds = []
+        self.train_targets = []
+
+    def on_validation_epoch_start(self):
+        self.val_preds = []
+        self.val_targets = []
+
+    def on_train_epoch_end(self):
+        if self.train_preds:
+            y_pred = np.concatenate(self.train_preds)
+            y_true = np.concatenate(self.train_targets)
+            train_acc = accuracy_score(y_true, y_pred)
+            train_bacc = balanced_accuracy_score(y_true, y_pred)
+            self.results['train_accuracy'].append(train_acc)
+            self.results['train_bacc'].append(train_bacc)
+            self.log('train_accuracy', train_acc, prog_bar=False)
+            self.log('train_bacc', train_bacc, prog_bar=False)
+
+    def on_validation_epoch_end(self):
+        if self.val_preds:
+            y_pred = np.concatenate(self.val_preds)
+            y_true = np.concatenate(self.val_targets)
+            val_acc = accuracy_score(y_true, y_pred)
+            val_bacc = balanced_accuracy_score(y_true, y_pred)
+            self.results['val_accuracy'].append(val_acc)
+            self.results['val_bacc'].append(val_bacc)
+            self.log('val_accuracy', val_acc, prog_bar=True)
+            self.log('val_bacc', val_bacc, prog_bar=True)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self._build_param_groups())
+
+        steps_per_epoch = max(1, getattr(self.trainer, 'num_training_batches', 1))
+        total_epochs = max(1, getattr(self.trainer, 'max_epochs', 1))
+
+        if total_epochs < self.warmup_epochs + 1:
+            lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1e-1,
+                end_factor=1,
+                total_iters=total_epochs * steps_per_epoch,
+            )
+        else:
+            scheduler1 = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1e-1,
+                end_factor=1,
+                total_iters=self.warmup_epochs * steps_per_epoch,
+            )
+            scheduler2 = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1,
+                end_factor=1e-1,
+                total_iters=(total_epochs - self.warmup_epochs) * steps_per_epoch,
+            )
+            lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                [scheduler1, scheduler2],
+                milestones=[self.warmup_epochs * steps_per_epoch],
+            )
+
         warnings.filterwarnings('ignore', category=UserWarning, module='torch.optim.lr_scheduler')
-        # Prepare automatic mixed precision training
-        scaler = torch.cuda.amp.GradScaler()
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': lr_scheduler,
+                'interval': 'step',
+            },
+        }
+
+    def fit(self, train_dataset, validation_dataset, batch_size, epochs):
+        self.train_preds = []
+        self.train_targets = []
+        self.val_preds = []
+        self.val_targets = []
 
         y_train = [ys for _, ys in train_dataset]
         y_val = [ys for _, ys in validation_dataset]
         y = y_train + y_val
-        class_weights = get_class_weights(y, self.n_out)
+        self.class_weights = get_class_weights(y, self.n_out)
 
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_dataloader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False)
 
-        temp_embed_ix, spat_embed_ix = create_embedding_ix(self.n_time, self.n_patches,
-                                                           self.chnames, ch_names_global)
-
-        # Loop over epochs
-        for i_epoch in range(epochs):
-            print(f"Epoch {i_epoch}")
-            # Loop over training batches
-            self.model.train()
-            e_pred_train = []  # collect predictions
-            y_true_train = []  # y in order seen
-            for x_b, y_b in tqdm(train_dataloader):
-                x_b = x_b[:, self.chmask, :]
-                n, c, t = x_b.shape
-                x_b = x_b.reshape(n, c, self.n_time, self.patch_size).cuda()
-                y_b = y_b.long() if self.n_out > 2 else y_b.float()
-                with torch.amp.autocast(device_type='cuda', dtype=self.amp_dtype):
-                    optimizer.zero_grad()
-                    p, _ = self.model(x_b, temp_embed_ix, spat_embed_ix)
-                    p = p.squeeze(-1)  # remove class dim if binary task
-                    loss_weight = class_weights if p.ndim == 2 else class_weights[y_b.long()]
-                    loss = self.criterion(p, y_b.cuda(), weight=loss_weight)
-
-
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                lr_scheduler.step()
-
-                # Collect class predictions to compute metrics on the full epoch
-                p = p.detach().cpu().float()
-                p = p.argmax(dim=-1) if p.ndim == 2 else torch.round(torch.sigmoid(p))
-                e_pred_train += [p.numpy()]
-                y_true_train += [y_b.numpy()]
-
-            # Loop over validation batches
-            self.model.eval()
-            e_pred_val = []  # collect predictions
-            y_true_val = []  # y in order seen
-            for x_b, y_b in tqdm(val_dataloader):
-                x_b = x_b[:, self.chmask, :]
-                n, c, t = x_b.shape
-                x_b = x_b.reshape(n, c, self.n_time, self.patch_size).cuda()
-                with torch.amp.autocast(device_type='cuda', dtype=self.amp_dtype):
-                    p, _ = self.model(x_b, temp_embed_ix, spat_embed_ix)
-                    p = p.squeeze(-1)  # remove class dim if binary task
-
-                # Collect class predictions to compute metrics on the full epoch
-                p = p.detach().cpu().float()
-                p = p.argmax(dim=-1) if p.ndim == 2 else torch.round(torch.sigmoid(p))
-                e_pred_val += [p.numpy()]
-                y_true_val += [y_b.numpy()]
-
-            # Compute accuracy and balanced accuracy
-            e_pred_train = np.concatenate(e_pred_train)
-            e_pred_val = np.concatenate(e_pred_val)
-            y_true_train = np.concatenate(y_true_train)
-            y_true_val = np.concatenate(y_true_val)
-
-            self.results['train_accuracy'] += [accuracy_score(y_true_train, e_pred_train)]
-            self.results['val_accuracy'] += [accuracy_score(y_true_val, e_pred_val)]
-            self.results['train_bacc'] += [balanced_accuracy_score(y_true_train, e_pred_train)]
-            self.results['val_bacc'] += [balanced_accuracy_score(y_true_val, e_pred_val)]
-            if len(validation_dataset) > 1:
-                print(f"VAL ACC: {self.results['val_accuracy'][-1]}, VAL BACC: {self.results['val_bacc'][-1]}")
+        trainer = Trainer(
+            max_epochs=epochs,
+            accelerator='auto',
+            devices=1,
+            log_every_n_steps=1,
+        )
+        trainer.fit(self, train_dataloader, val_dataloader)
